@@ -337,13 +337,13 @@ const TournamentEntrySync = {
 
     const finalRows = retainedRows.concat(newRows);
 
-    // Sort by Tournament Date, Tournament Name, Active (false) before Withdrawn (true), then Class
+    // Sort by Tournament Date, Tournament Name, Class, then Player 1
     finalRows.sort((a, b) => {
       return (
         String(a[2]).localeCompare(String(b[2])) ||
         String(a[1]).localeCompare(String(b[1])) ||
-        Number(Boolean(a[3])) - Number(Boolean(b[3])) ||
-        String(a[4]).localeCompare(String(b[4]))
+        String(a[4]).localeCompare(String(b[4])) ||
+        String(a[5]).localeCompare(String(b[5]))
       );
     });
 
