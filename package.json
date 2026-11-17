@@ -1,0 +1,24 @@
+{
+  "name": "gas-automations",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kingsunsha-priv/gas-automations.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/kingsunsha-priv/gas-automations/issues"
+  },
+  "homepage": "https://github.com/kingsunsha-priv/gas-automations#readme",
+  "devDependencies": {
+    "@types/google-apps-script": "^2.0.15"
+  }
+}
