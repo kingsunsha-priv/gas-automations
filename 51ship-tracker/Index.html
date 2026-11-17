@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    body { padding: 20px; background-color: #f8f9fa; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    .card { box-shadow: 0 4px 6px rgba(0,0,0,0.05); border: none; margin-bottom: 20px; }
+    .log-cell { white-space: pre-wrap; font-size: 0.85em; max-height: 120px; overflow-y: auto; display: block; color: #495057; }
+    .tracking-info { font-weight: 500; color: #0d6efd; white-space: pre-wrap; font-size: 0.9em; }
+    .delivered-row { background-color: #f8fff9 !important; color: #6c757d; }
+    .delivered-badge { font-size: 0.75em; padding: 4px 8px; }
+    th { font-size: 0.9em; color: #495057; white-space: nowrap; }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+</head>
+<body>
+
+  <div class="container-fluid">
+    <div class="row mb-4">
+      <!-- Add Shipment Form -->
+      <div class="col-lg-5">
+        <div class="card p-3">
+          <h5 class="mb-3">添加新运单 (Add Shipment)</h5>
+          <form id="addForm" onsubmit="event.preventDefault(); submitNewShipment();">
+            
+            <div class="row g-2 mb-2">
+              <div class="col-sm-8">
+                <input type="text" id="trackingNo" class="form-control" placeholder="运单号 (Tracking No)" required>
+              </div>
+              <div class="col-sm-4">
+                <select id="transType" class="form-select">
+                  <option value="铁路-欧盟普货">铁路-欧盟普货</option>
+                  <option value="铁路-欧盟食品">铁路-欧盟食品</option>
+                  <option value="卡航-欧盟普货">卡航-欧盟普货</option>
+                  <option value="卡航-欧盟食品">卡航-欧盟食品</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="row g-2 mb-2">
+              <div class="col-4">
+                <input type="text" id="groupNo" class="form-control" placeholder="团号" required>
+              </div>
+              <div class="col-4">
+                <input type="text" id="groupName" class="form-control" placeholder="团名" required>
+              </div>
+              <div class="col-4">
+                <input type="date" id="shipDate" class="form-control" placeholder="发货日期" required>
+              </div>
+            </div>
+
+            <button type="submit" id="addBtn" class="btn btn-primary w-100 mt-2">添加 (Add)</button>
+          </form>
+        </div>
+      </div>
+      
+      <!-- Controls -->
+      <div class="col-lg-7 d-flex align-items-center justify-content-end">
+        <button id="refreshBtn" class="btn btn-outline-secondary" onclick="refreshAll()">
+          <span id="refreshSpinner" class="spinner-border spinner-border-sm d-none" role="status"></span> 
+          刷新所有运单状态 (Refresh All)
+        </button>
+      </div>
+    </div>
+
+    <!-- Search Bar -->
+    <div class="row mb-3">
+      <div class="col-12">
+        <input type="text" id="searchInput" class="form-control form-control-lg shadow-sm" placeholder="🔍 搜索 团号, 团名, 或 运单号 (Search shipments...)" onkeyup="filterTable()">
+      </div>
+    </div>
+
+    <!-- Data Table -->
+    <div class="card p-0 overflow-hidden">
+      <div class="table-responsive">
+        <table class="table table-hover mb-0">
+          <thead class="table-light" id="tableHead"></thead>
+          <tbody id="tableBody">
+            <tr><td colspan="15" class="text-center py-4 text-muted">加载中... (Loading Data)</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- Edit Modal -->
+  <div class="modal fade" id="editModal" tabindex="-1">
+    <div class="modal-dialog">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title">修改运单 (Edit Shipment)</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <form id="editForm" onsubmit="event.preventDefault(); submitEdit();">
+            <input type="hidden" id="editTrackingNo">
+            
+            <div class="mb-3">
+              <label class="form-label text-muted">运单号 (Tracking No) - 不可改</label>
+              <input type="text" id="editTrackingNoDisplay" class="form-control" disabled>
+            </div>
+
+            <div class="mb-3">
+              <label class="form-label">种类 (Type)</label>
+              <select id="editTransType" class="form-select">
+                <option value="铁路-欧盟普货">铁路-欧盟普货</option>
+                <option value="铁路-欧盟食品">铁路-欧盟食品</option>
+                <option value="卡航-欧盟普货">卡航-欧盟普货</option>
+                <option value="卡航-欧盟食品">卡航-欧盟食品</option>
+              </select>
+            </div>
+
+            <div class="mb-3">
+              <label class="form-label">团名 (Group Name)</label>
+              <input type="text" id="editGroupName" class="form-control">
+            </div>
+
+            <div class="mb-3">
+              <label class="form-label">发货日期 (Ship Date)</label>
+              <input type="date" id="editShipDate" class="form-control">
+            </div>
+
+            <button type="submit" id="saveEditBtn" class="btn btn-primary w-100">保存修改 (Save Changes)</button>
+          </form>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    document.addEventListener("DOMContentLoaded", loadData);
+
+    function loadData() {
+      google.script.run.withSuccessHandler(renderTable).getShipmentData();
+    }
+
+    function submitNewShipment() {
+      var btn = document.getElementById('addBtn');
+      var trackInput = document.getElementById('trackingNo');
+      var typeInput = document.getElementById('transType');
+      var groupNoInput = document.getElementById('groupNo');
+      var groupNameInput = document.getElementById('groupName');
+      var shipDateInput = document.getElementById('shipDate');
+      
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span>';
+      
+      google.script.run
+        // ADDED: Catch the duplicate error and alert the user
+        .withFailureHandler(function(error) {
+          alert(error.message);
+          btn.disabled = false;
+          btn.innerHTML = '添加 (Add)';
+        })
+        .withSuccessHandler(function(data) {
+          trackInput.value = '';
+          groupNoInput.value = '';
+          groupNameInput.value = '';
+          shipDateInput.value = '';
+          btn.disabled = false;
+          btn.innerHTML = '添加 (Add)';
+          renderTable(data);
+        }).addShipmentAndRefresh(
+          trackInput.value, 
+          typeInput.value,
+          groupNoInput.value,
+          groupNameInput.value,
+          shipDateInput.value
+        );
+    }
+
+    function refreshAll() {
+      var btn = document.getElementById('refreshBtn');
+      var spinner = document.getElementById('refreshSpinner');
+      btn.disabled = true;
+      spinner.classList.remove('d-none');
+      
+      google.script.run.withSuccessHandler(function(data) {
+        btn.disabled = false;
+        spinner.classList.add('d-none');
+        renderTable(data);
+      }).refreshAllShipments();
+    }
+
+    function renderTable(data) {
+      if (!data || data.length === 0) return;
+      
+      var headers = data[0];
+      // Restored the action column header
+      var theadHtml = '<tr><th>操作</th>';
+      
+      // Added ETA column to display support
+      var colsToShow = ["团号", "团名", "运单号", "种类", "发货日期", "已到货", "目的国家", "ETA", "预计到达", "末条追踪轨迹", "详细轨迹"];
+      var colIndexes = [];
+      
+      headers.forEach(function(h, index) {
+        if (colsToShow.includes(h)) {
+          theadHtml += '<th>' + h + '</th>';
+          colIndexes.push(index);
+        }
+      });
+      theadHtml += '</tr>';
+      document.getElementById('tableHead').innerHTML = theadHtml;
+
+      var tbodyHtml = '';
+      var receivedIndex = headers.indexOf("已到货");
+      
+      var trackIdx = headers.indexOf("运单号");
+      var typeIdx = headers.indexOf("种类");
+      var groupIdx = headers.indexOf("团名");
+      var dateIdx = headers.indexOf("发货日期");
+      
+      for (var i = 1; i < data.length; i++) {
+        var row = data[i];
+        if(!row[trackIdx]) continue; 
+
+        var isDelivered = (receivedIndex !== -1 && row[receivedIndex] === "TRUE");
+        var trClass = isDelivered ? 'class="delivered-row"' : '';
+        
+        tbodyHtml += '<tr ' + trClass + '>';
+        
+        // Render Edit Button
+        var trackStr = String(row[trackIdx] || "").replace(/'/g, "\\'");
+        var typeStr = String(typeIdx !== -1 ? row[typeIdx] : "").replace(/'/g, "\\'");
+        var groupStr = String(groupIdx !== -1 ? row[groupIdx] : "").replace(/'/g, "\\'");
+        
+        var dateRaw = String(dateIdx !== -1 ? row[dateIdx] : "");
+        var cleanDate = "";
+        var dateMatch = dateRaw.match(/^(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})/);
+        if (dateMatch) {
+          cleanDate = dateMatch[1] + '-' + ("0" + dateMatch[2]).slice(-2) + '-' + ("0" + dateMatch[3]).slice(-2);
+        }
+        
+        // Uncommented the Edit button rendering
+        tbodyHtml += '<td><button class="btn btn-sm btn-outline-primary" onclick="openEditModal(\''+trackStr+'\', \''+typeStr+'\', \''+groupStr+'\', \''+cleanDate+'\')">编辑</button></td>';
+        
+        colIndexes.forEach(function(colIdx) {
+          var headerName = headers[colIdx];
+          var cellVal = row[colIdx];
+          
+          if (headerName === "已到货") {
+            tbodyHtml += '<td>' + (isDelivered ? '<span class="badge bg-success delivered-badge">已签收</span>' : '<span class="badge bg-warning text-dark delivered-badge">运输中</span>') + '</td>';
+          } 
+          else if (headerName === "详细轨迹") {
+            tbodyHtml += '<td><div class="log-cell">' + cellVal + '</div></td>';
+          } 
+          else if (headerName === "末条追踪轨迹") {
+            tbodyHtml += '<td><div class="tracking-info">' + cellVal + '</div></td>';
+          } 
+          else {
+            tbodyHtml += '<td>' + cellVal + '</td>';
+          }
+        });
+        tbodyHtml += '</tr>';
+      }
+      document.getElementById('tableBody').innerHTML = tbodyHtml;
+    }
+
+    function filterTable() {
+      var input = document.getElementById("searchInput").value.toUpperCase();
+      var rows = document.getElementById("tableBody").getElementsByTagName("tr");
+
+      for (var i = 0; i < rows.length; i++) {
+        var rowText = rows[i].innerText.toUpperCase();
+        if (rowText.indexOf(input) > -1) {
+          rows[i].style.display = "";
+        } else {
+          rows[i].style.display = "none";
+        }
+      }
+    }
+
+    function openEditModal(trackingNo, transType, groupName, shipDate) {
+      document.getElementById('editTrackingNo').value = trackingNo;
+      document.getElementById('editTrackingNoDisplay').value = trackingNo;
+      document.getElementById('editTransType').value = transType || '铁路-欧盟普货';
+      document.getElementById('editGroupName').value = groupName || '';
+      document.getElementById('editShipDate').value = shipDate || '';
+      
+      var editModal = new bootstrap.Modal(document.getElementById('editModal'));
+      editModal.show();
+    }
+
+    function submitEdit() {
+      var btn = document.getElementById('saveEditBtn');
+      var trackNo = document.getElementById('editTrackingNo').value;
+      var typeVal = document.getElementById('editTransType').value;
+      var groupVal = document.getElementById('editGroupName').value;
+      var dateVal = document.getElementById('editShipDate').value;
+      
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span>';
+      
+      google.script.run.withSuccessHandler(function(data) {
+        btn.disabled = false;
+        btn.innerHTML = '保存修改 (Save Changes)';
+        var modalInstance = bootstrap.Modal.getInstance(document.getElementById('editModal'));
+        modalInstance.hide();
+        renderTable(data);
+      }).updateShipment(trackNo, groupVal, typeVal, dateVal);
+    }
+  </script>
+</body>
+</html>
