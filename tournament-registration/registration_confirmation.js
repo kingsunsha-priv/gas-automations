@@ -18,9 +18,10 @@ function syncTournamentEntriesFromGmail() {
 const TournamentEntrySync = {
   // Configuration
   LOOKBACK_DAYS: 60,               // Search Gmail messages from the last N days
-  INCLUDE_PAST_TOURNAMENTS: false, // Set to true if you also want ended tournaments (e.g., 2026-11-07)
+  INCLUDE_PAST_TOURNAMENTS: false, // Set to true if you also want ended tournaments
   MAX_THREADS: 50,
   SHEET_NAME: 'Tournament Entries',
+  MSG_META_CACHE_KEY: 'ts_msg_meta_v2',
 
   // Lazy-loaded spreadsheet reference
   _spreadsheet: null,
@@ -31,8 +32,14 @@ const TournamentEntrySync = {
     return this._spreadsheet;
   },
 
+  isGuid(val) {
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+      String(val || '').trim()
+    );
+  },
+
   /**
-   * Orchestrates Gmail fetching, deduplication, HTML parsing, and Sheet updates.
+   * Orchestrates Gmail fetching, incremental change detection, HTML parsing, and Sheet updates.
    */
   run() {
     const latestMessages = this.fetchLatestMessagesByTournament();
@@ -42,17 +49,46 @@ const TournamentEntrySync = {
       return;
     }
 
-    const todayStart = new Date();
-    todayStart.setHours(0, 0, 0, 0);
+    const headers = [
+      'Tournament ID',
+      'Tournament Name',
+      'Tournament Date',
+      'Withdrawn',
+      'Class',
+      'Player 1',
+      'License 1',
+      'Country 1',
+      'Gender 1',
+      'Player 2',
+      'License 2',
+      'Country 2',
+      'Gender 2',
+      'Request Status',
+      'Removed On',
+      'Withdrawal Reason',
+      'Total Tournament Cost',
+      'Email Timestamp',
+    ];
+
+    const sheet = this.getOrCreateSheet(this.SHEET_NAME, headers);
+    const existingData = sheet.getDataRange().getValues();
+    const existingTimestamps = this.getExistingTimestampMap(existingData, 0, headers.length - 1);
+
+    // Force a clean rewrite if any legacy non-GUID rows (e.g., subject-fallback duplicates) exist
+    const hasInvalidIdRows = existingData
+      .slice(1)
+      .some((row) => row[0] && !this.isGuid(row[0]));
 
     const parsedTournaments = [];
     latestMessages.forEach((entry) => {
-      const parsed = this.parseConfirmationEmail(entry.message, entry.tournamentId);
+      const savedTime = existingTimestamps.get(entry.tournamentId) || 0;
 
-      if (!this.INCLUDE_PAST_TOURNAMENTS && parsed.endDate && parsed.endDate < todayStart) {
-        Logger.log(`Skipping past tournament: ${parsed.tournamentName} (${parsed.tournamentDate})`);
+      // Skip downloading/parsing full HTML body if already synced and no legacy cleanup is needed
+      if (!hasInvalidIdRows && entry.date.getTime() <= savedTime + 1000) {
         return;
       }
+
+      const parsed = this.parseConfirmationEmail(entry.message, entry.tournamentId);
 
       const activeCount = parsed.entries.filter((e) => !e.withdrawn).length;
       const withdrawnCount = parsed.entries.filter((e) => e.withdrawn).length;
@@ -64,51 +100,99 @@ const TournamentEntrySync = {
     });
 
     if (parsedTournaments.length === 0) {
-      Logger.log('No current or upcoming tournaments found to sync.');
+      Logger.log('Tournament Entries sheet is already up to date.');
       return;
     }
 
-    this.syncEntriesSheet(parsedTournaments);
+    this.syncEntriesSheet(sheet, headers, existingData, parsedTournaments);
   },
 
   /**
-   * Searches recent Gmail confirmations and keeps ONLY the newest message per Tournament ID.
+   * Searches recent Gmail confirmations and keeps ONLY the newest message per Tournament ID,
+   * caching message metadata in CacheService so already-seen emails don't re-download bodies.
    */
   fetchLatestMessagesByTournament() {
     const query = `from:notifications@tournamentsoftware.com subject:"bekräftelse av anmälan till" newer_than:${this.LOOKBACK_DAYS}d`;
     const threads = GmailApp.search(query, 0, this.MAX_THREADS);
     const latestByTournament = new Map();
 
+    const cache = CacheService.getScriptCache();
+    let msgMeta = {};
+    try {
+      const rawMeta = cache.get(this.MSG_META_CACHE_KEY);
+      if (rawMeta) msgMeta = JSON.parse(rawMeta);
+    } catch (e) {
+      msgMeta = {};
+    }
+    let metaChanged = false;
+
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
+    const todayMs = todayStart.getTime();
+
     threads.forEach((thread) => {
       const messages = thread.getMessages();
-      messages.forEach((msg) => {
-        const html = msg.getBody();
-        const tournamentId = this.extractTournamentId(html, msg.getSubject());
-        const msgDate = msg.getDate();
+      if (messages.length === 0) return;
 
-        const existing = latestByTournament.get(tournamentId);
-        if (!existing || msgDate.getTime() > existing.date.getTime()) {
-          latestByTournament.set(tournamentId, {
-            tournamentId,
-            date: msgDate,
-            message: msg,
-          });
-        }
-      });
+      // Gmail orders messages in a thread chronologically; only inspect the newest message
+      const msg = messages[messages.length - 1];
+      const msgId = msg.getId();
+      const msgDate = msg.getDate();
+
+      let info = msgMeta[msgId];
+      if (!info || !this.isGuid(info.tournamentId)) {
+        // Strip inline base64 logos so the full HTML structure is lightweight and intact
+        const cleanHtml = msg.getBody().replace(/data:image\/[^;]+;base64,[A-Za-z0-9+/=]+/gi, '');
+        const tournamentId = this.extractTournamentId(cleanHtml, msg.getSubject());
+
+        const $ = Cheerio.load(cleanHtml);
+        const tournamentDate = ($('span.text-label--sub').first().text() || '')
+          .replace(/\u00a0/g, ' ')
+          .trim();
+        const endDate = this.parseEndDate(tournamentDate);
+
+        info = {
+          tournamentId,
+          endDateMs: endDate ? endDate.getTime() : null,
+        };
+        msgMeta[msgId] = info;
+        metaChanged = true;
+      }
+
+      if (!this.INCLUDE_PAST_TOURNAMENTS && info.endDateMs && info.endDateMs < todayMs) {
+        return;
+      }
+
+      const existing = latestByTournament.get(info.tournamentId);
+      if (!existing || msgDate.getTime() > existing.date.getTime()) {
+        latestByTournament.set(info.tournamentId, {
+          tournamentId: info.tournamentId,
+          date: msgDate,
+          message: msg,
+        });
+      }
     });
+
+    if (metaChanged) {
+      try {
+        cache.put(this.MSG_META_CACHE_KEY, JSON.stringify(msgMeta), 21600);
+      } catch (e) {
+        // Ignore cache write errors if payload exceeds 100 KB
+      }
+    }
 
     return latestByTournament;
   },
 
   /**
-   * Extracts the 36-character TournamentSoftware GUID from URL-decoded links in the email.
+   * Extracts the 36-character TournamentSoftware GUID from URL-decoded links across the full email.
    */
-  extractTournamentId(html, subjectFallback) {
-    const $ = Cheerio.load(html);
-    let foundGuid = null;
+  extractTournamentId(cleanHtml, subjectFallback) {
+    const hrefRegex = /href\s*=\s*["']([^"']+)["']/gi;
+    let match;
 
-    $('a[href]').each((i, el) => {
-      let href = $(el).attr('href') || '';
+    while ((match = hrefRegex.exec(cleanHtml)) !== null) {
+      let href = match[1];
       try {
         href = decodeURIComponent(href);
       } catch (e) {
@@ -118,16 +202,25 @@ const TournamentEntrySync = {
       if (href.toLowerCase().includes('tournamentsoftware.com')) {
         const guidMatch = href.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
         if (guidMatch) {
-          foundGuid = guidMatch[0].toUpperCase();
-          return false;
+          return guidMatch[0].toUpperCase();
         }
       }
-    });
+    }
 
-    if (foundGuid) return foundGuid;
+    const $ = Cheerio.load(cleanHtml);
+    const cleanName = $('a.mail-media__link')
+      .first()
+      .text()
+      .replace(/\u00a0/g, ' ')
+      .replace(/,+\s*$/, '')
+      .trim();
 
-    const cleanName = $('a.mail-media__link').first().text().replace(/\u00a0/g, ' ').trim();
-    return cleanName || subjectFallback.replace(/^.*bekräftelse av anmälan till\s*/i, '').trim();
+    if (cleanName) return cleanName;
+
+    return (subjectFallback || '')
+      .replace(/^.*bekräftelse av anmälan till\s*/i, '')
+      .replace(/,+\s*$/, '')
+      .trim();
   },
 
   /**
@@ -273,34 +366,10 @@ const TournamentEntrySync = {
   },
 
   /**
-   * Syncs all confirmed and withdrawn entries into one sheet, overwriting
-   * existing rows for each refreshed tournament ID.
+   * Syncs confirmed and withdrawn entries into one sheet, overwriting
+   * existing rows only for tournaments that received a newer email.
    */
-  syncEntriesSheet(parsedTournaments) {
-    const headers = [
-      'Tournament ID',
-      'Tournament Name',
-      'Tournament Date',
-      'Withdrawn',
-      'Class',
-      'Player 1',
-      'License 1',
-      'Country 1',
-      'Gender 1',
-      'Player 2',
-      'License 2',
-      'Country 2',
-      'Gender 2',
-      'Request Status',
-      'Removed On',
-      'Withdrawal Reason',
-      'Total Tournament Cost',
-      'Email Timestamp',
-    ];
-
-    const sheet = this.getOrCreateSheet(this.SHEET_NAME, headers);
-    const existingData = sheet.getDataRange().getValues();
-
+  syncEntriesSheet(sheet, headers, existingData, parsedTournaments) {
     const tournamentsToOverwrite = new Set();
     const newRows = [];
 
@@ -331,9 +400,11 @@ const TournamentEntrySync = {
       });
     });
 
-    const retainedRows = existingData
-      .slice(1)
-      .filter((row) => row[0] && !tournamentsToOverwrite.has(String(row[0]).trim()));
+    // Drop rows being overwritten AND any legacy non-GUID fallback rows
+    const retainedRows = existingData.slice(1).filter((row) => {
+      const rowId = String(row[0] || '').trim();
+      return rowId && this.isGuid(rowId) && !tournamentsToOverwrite.has(rowId);
+    });
 
     const finalRows = retainedRows.concat(newRows);
 
@@ -348,9 +419,25 @@ const TournamentEntrySync = {
     });
 
     this.writeBatchToSheet(sheet, headers, finalRows);
+    CacheService.getScriptCache().remove(PUBLIC_ENTRIES_CACHE_KEY);
     Logger.log(
       `Synced ${this.SHEET_NAME}: updated ${tournamentsToOverwrite.size} tournament(s), total ${finalRows.length} rows.`
     );
+  },
+
+  getExistingTimestampMap(sheetValues, idColIndex, timestampColIndex) {
+    const map = new Map();
+    for (let i = 1; i < sheetValues.length; i++) {
+      const id = String(sheetValues[i][idColIndex] || '').trim();
+      const rawDate = sheetValues[i][timestampColIndex];
+      if (!id || !rawDate) continue;
+
+      const time = rawDate instanceof Date ? rawDate.getTime() : new Date(rawDate).getTime();
+      if (!isNaN(time) && (!map.has(id) || time > map.get(id))) {
+        map.set(id, time);
+      }
+    }
+    return map;
   },
 
   getOrCreateSheet(sheetName, headers) {
@@ -377,3 +464,109 @@ const TournamentEntrySync = {
     }
   },
 };
+
+// =========================================================
+// 3. WEB APP ENDPOINTS (Cached + Single-Trip Injection)
+// =========================================================
+
+const PUBLIC_ENTRIES_CACHE_KEY = 'public_tournament_entries_v1';
+const PUBLIC_ENTRIES_CACHE_TTL = 21600; // 6 hours
+
+/**
+ * Serves the public registration page with data pre-injected into the HTML template,
+ * eliminating the second google.script.run round-trip on page load.
+ */
+function doGet() {
+  const template = HtmlService.createTemplateFromFile('Index');
+  const initialPayload = getPublicTournamentEntries(false);
+  template.initialDataJson = JSON.stringify(initialPayload).replace(/</g, '\\u003c');
+
+  return template
+    .evaluate()
+    .setTitle('Lugi Badminton - Tävlingsanmälningar')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL)
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1');
+}
+
+/**
+ * Returns sanitized entry rows from CacheService (fast path) or "Tournament Entries" sheet.
+ * @param {boolean=} forceRefresh Bypass cache and reload directly from the sheet.
+ */
+function getPublicTournamentEntries(forceRefresh) {
+  const cache = CacheService.getScriptCache();
+
+  if (!forceRefresh) {
+    const cachedJson = cache.get(PUBLIC_ENTRIES_CACHE_KEY);
+    if (cachedJson) {
+      return JSON.parse(cachedJson);
+    }
+  }
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(TournamentEntrySync.SHEET_NAME);
+  const lastRow = sheet ? sheet.getLastRow() : 0;
+
+  if (!sheet || lastRow <= 1) {
+    return { entries: [], lastUpdated: '' };
+  }
+
+  const values = sheet.getRange(2, 1, lastRow - 1, 18).getDisplayValues();
+  const entries = [];
+  let latestSync = '';
+
+  // Column indices (0-based):
+  // 1: Tournament Name, 2: Tournament Date, 3: Withdrawn, 4: Class,
+  // 5: Player 1, 9: Player 2, 13: Request Status, 14: Removed On, 17: Email Timestamp
+  for (let i = 0; i < values.length; i++) {
+    const row = values[i];
+    if (!row[1]) continue;
+
+    const emailTs = row[17] || '';
+    if (emailTs > latestSync) {
+      latestSync = emailTs;
+    }
+
+    entries.push({
+      tournamentName: row[1],
+      tournamentDate: row[2],
+      withdrawn: String(row[3]).toUpperCase() === 'TRUE',
+      klass: row[4],
+      player1: row[5],
+      player2: row[9],
+      status: row[13],
+      removedOn: row[14],
+    });
+  }
+
+  const payload = {
+    entries,
+    lastUpdated: latestSync,
+  };
+
+  try {
+    cache.put(PUBLIC_ENTRIES_CACHE_KEY, JSON.stringify(payload), PUBLIC_ENTRIES_CACHE_TTL);
+  } catch (e) {
+    // Ignore cache write errors if payload exceeds 100 KB
+  }
+
+  return payload;
+}
+
+/**
+ * Triggered by the Web App "Synka & uppdatera" button.
+ * Runs Gmail confirmation sync, rebuilds the cache, and returns fresh rows.
+ */
+function syncAndGetTournamentEntries() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) {
+    throw new Error('En synkronisering pågår redan. Vänta några sekunder och försök igen.');
+  }
+
+  try {
+    TournamentEntrySync.run();
+    SpreadsheetApp.flush();
+    return getPublicTournamentEntries(true);
+  } finally {
+    lock.releaseLock();
+  }
+}
