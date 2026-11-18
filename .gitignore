@@ -1,3 +1,8 @@
 node_modules/
 .clasprc.json
 .env
+
+# Generated copies from shared/variables.js
+# npm run sync:shared
+*/variables.js
+!shared/variables.js
