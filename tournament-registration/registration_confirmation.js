@@ -4,8 +4,7 @@
 
 /**
  * Main entry point: Fetches the latest Badminton Sweden entry confirmation
- * email per tournament from Gmail and syncs both confirmed and withdrawn
- * entries into a single Google Sheet.
+ * and doubles pair status update emails from Gmail and syncs to Google Sheets.
  */
 function syncTournamentEntriesFromGmail() {
   TournamentEntrySync.run();
@@ -17,11 +16,17 @@ function syncTournamentEntriesFromGmail() {
 
 const TournamentEntrySync = {
   // Configuration
-  LOOKBACK_DAYS: 60,               // Search Gmail messages from the last N days
+  DEFAULT_LOOKBACK_DAYS: 60,       // Fallback if registration.lookback_days is missing in central config
   INCLUDE_PAST_TOURNAMENTS: false, // Set to true if you also want ended tournaments
-  MAX_THREADS: 50,
+  MAX_THREADS: 80,
   SHEET_NAME: 'Tournament Entries',
-  MSG_META_CACHE_KEY: 'ts_msg_meta_v2',
+  MSG_META_CACHE_KEY: 'ts_msg_meta_v3',
+
+  get lookbackDays() {
+    const raw = App.forModule('registration').get('lookback_days', true);
+    const parsed = parseInt(raw, 10);
+    return !isNaN(parsed) && parsed > 0 ? parsed : this.DEFAULT_LOOKBACK_DAYS;
+  },
 
   // Lazy-loaded spreadsheet reference
   _spreadsheet: null,
@@ -39,13 +44,14 @@ const TournamentEntrySync = {
   },
 
   /**
-   * Orchestrates Gmail fetching, incremental change detection, HTML parsing, and Sheet updates.
+   * Orchestrates Gmail fetching, full snapshot parsing, doubles status patching,
+   * and Google Sheet updates.
    */
   run() {
-    const latestMessages = this.fetchLatestMessagesByTournament();
+    const groupedMessages = this.fetchMessagesByTournament();
 
-    if (latestMessages.size === 0) {
-      Logger.log('No matching Badminton Sweden confirmation emails found.');
+    if (groupedMessages.size === 0) {
+      Logger.log('No matching Badminton Sweden confirmation or doubles status emails found.');
       return;
     }
 
@@ -74,47 +80,61 @@ const TournamentEntrySync = {
     const existingData = sheet.getDataRange().getValues();
     const existingTimestamps = this.getExistingTimestampMap(existingData, 0, headers.length - 1);
 
-    // Force a clean rewrite if any legacy non-GUID rows (e.g., subject-fallback duplicates) exist
+    // Force a clean rewrite if any legacy non-GUID rows exist
     const hasInvalidIdRows = existingData
       .slice(1)
       .some((row) => row[0] && !this.isGuid(row[0]));
 
-    const parsedTournaments = [];
-    latestMessages.forEach((entry) => {
-      const savedTime = existingTimestamps.get(entry.tournamentId) || 0;
+    const tournamentsToProcess = [];
 
-      // Skip downloading/parsing full HTML body if already synced and no legacy cleanup is needed
-      if (!hasInvalidIdRows && entry.date.getTime() <= savedTime + 1000) {
+    groupedMessages.forEach((group, tournamentId) => {
+      const savedTime = existingTimestamps.get(tournamentId) || 0;
+      const latestSnapshot = group.latestSnapshot;
+
+      // Only consider doubles updates that are newer than the latest full snapshot
+      const relevantDoublesUpdates = group.doublesUpdates
+        .filter((u) => !latestSnapshot || u.date.getTime() > latestSnapshot.date.getTime())
+        .sort((a, b) => a.date.getTime() - b.date.getTime());
+
+      // Determine the newest timestamp across snapshot and doubles updates for this tournament
+      let newestEmailTime = latestSnapshot ? latestSnapshot.date.getTime() : 0;
+      relevantDoublesUpdates.forEach((u) => {
+        if (u.date.getTime() > newestEmailTime) {
+          newestEmailTime = u.date.getTime();
+        }
+      });
+
+      // Skip if nothing newer than what is already stored in the sheet
+      if (!hasInvalidIdRows && newestEmailTime <= savedTime + 1000) {
         return;
       }
 
-      const parsed = this.parseConfirmationEmail(entry.message, entry.tournamentId);
-
-      const activeCount = parsed.entries.filter((e) => !e.withdrawn).length;
-      const withdrawnCount = parsed.entries.filter((e) => e.withdrawn).length;
-      Logger.log(
-        `Parsed "${parsed.tournamentName}" (${parsed.tournamentDate}) -> Confirmed: ${activeCount}, Withdrawn: ${withdrawnCount}`
-      );
-
-      parsedTournaments.push(parsed);
+      tournamentsToProcess.push({
+        tournamentId,
+        latestSnapshot,
+        relevantDoublesUpdates,
+        newestEmailDate: new Date(newestEmailTime),
+      });
     });
 
-    if (parsedTournaments.length === 0) {
+    if (tournamentsToProcess.length === 0) {
       Logger.log('Tournament Entries sheet is already up to date.');
       return;
     }
 
-    this.syncEntriesSheet(sheet, headers, existingData, parsedTournaments);
+    this.syncEntriesSheet(sheet, headers, existingData, tournamentsToProcess);
   },
 
   /**
-   * Searches recent Gmail confirmations and keeps ONLY the newest message per Tournament ID,
-   * caching message metadata in CacheService so already-seen emails don't re-download bodies.
+   * Searches recent Gmail for both:
+   *  1) Full group entry confirmations ("bekräftelse av anmälan till")
+   *  2) Doubles pair status updates ("Status update for one of your doubles pairs")
+   * Groups them by Tournament GUID.
    */
-  fetchLatestMessagesByTournament() {
-    const query = `from:notifications@tournamentsoftware.com subject:"bekräftelse av anmälan till" newer_than:${this.LOOKBACK_DAYS}d`;
+fetchMessagesByTournament() {
+    const query = `from:notifications@tournamentsoftware.com (subject:"bekräftelse av anmälan till" OR subject:"Status update for one of your doubles pairs") newer_than:${this.lookbackDays}d`;
     const threads = GmailApp.search(query, 0, this.MAX_THREADS);
-    const latestByTournament = new Map();
+    const byTournament = new Map();
 
     const cache = CacheService.getScriptCache();
     let msgMeta = {};
@@ -132,45 +152,52 @@ const TournamentEntrySync = {
 
     threads.forEach((thread) => {
       const messages = thread.getMessages();
-      if (messages.length === 0) return;
+      messages.forEach((msg) => {
+        const msgId = msg.getId();
+        const msgDate = msg.getDate();
+        const subject = msg.getSubject() || '';
+        const isDoublesUpdate = /status update for one of your doubles pairs/i.test(subject);
 
-      // Gmail orders messages in a thread chronologically; only inspect the newest message
-      const msg = messages[messages.length - 1];
-      const msgId = msg.getId();
-      const msgDate = msg.getDate();
+        let info = msgMeta[msgId];
+        if (!info || !this.isGuid(info.tournamentId)) {
+          const cleanHtml = msg.getBody().replace(/data:image\/[^;]+;base64,[A-Za-z0-9+/=]+/gi, '');
+          const tournamentId = this.extractTournamentId(cleanHtml, subject);
 
-      let info = msgMeta[msgId];
-      if (!info || !this.isGuid(info.tournamentId)) {
-        // Strip inline base64 logos so the full HTML structure is lightweight and intact
-        const cleanHtml = msg.getBody().replace(/data:image\/[^;]+;base64,[A-Za-z0-9+/=]+/gi, '');
-        const tournamentId = this.extractTournamentId(cleanHtml, msg.getSubject());
+          const $ = Cheerio.load(cleanHtml);
+          const tournamentDate = ($('span.text-label--sub').first().text() || '')
+            .replace(/\u00a0/g, ' ')
+            .trim();
+          const endDate = this.parseEndDate(tournamentDate);
 
-        const $ = Cheerio.load(cleanHtml);
-        const tournamentDate = ($('span.text-label--sub').first().text() || '')
-          .replace(/\u00a0/g, ' ')
-          .trim();
-        const endDate = this.parseEndDate(tournamentDate);
+          info = {
+            tournamentId,
+            endDateMs: endDate ? endDate.getTime() : null,
+            type: isDoublesUpdate ? 'doubles_update' : 'snapshot',
+          };
+          msgMeta[msgId] = info;
+          metaChanged = true;
+        }
 
-        info = {
-          tournamentId,
-          endDateMs: endDate ? endDate.getTime() : null,
-        };
-        msgMeta[msgId] = info;
-        metaChanged = true;
-      }
+        if (!this.INCLUDE_PAST_TOURNAMENTS && info.endDateMs && info.endDateMs < todayMs) {
+          return;
+        }
 
-      if (!this.INCLUDE_PAST_TOURNAMENTS && info.endDateMs && info.endDateMs < todayMs) {
-        return;
-      }
+        if (!byTournament.has(info.tournamentId)) {
+          byTournament.set(info.tournamentId, {
+            latestSnapshot: null,
+            doublesUpdates: [],
+          });
+        }
 
-      const existing = latestByTournament.get(info.tournamentId);
-      if (!existing || msgDate.getTime() > existing.date.getTime()) {
-        latestByTournament.set(info.tournamentId, {
-          tournamentId: info.tournamentId,
-          date: msgDate,
-          message: msg,
-        });
-      }
+        const bucket = byTournament.get(info.tournamentId);
+        if (info.type === 'doubles_update') {
+          bucket.doublesUpdates.push({ date: msgDate, message: msg });
+        } else {
+          if (!bucket.latestSnapshot || msgDate.getTime() > bucket.latestSnapshot.date.getTime()) {
+            bucket.latestSnapshot = { date: msgDate, message: msg };
+          }
+        }
+      });
     });
 
     if (metaChanged) {
@@ -181,11 +208,11 @@ const TournamentEntrySync = {
       }
     }
 
-    return latestByTournament;
+    return byTournament;
   },
 
   /**
-   * Extracts the 36-character TournamentSoftware GUID from URL-decoded links across the full email.
+   * Extracts the 36-character TournamentSoftware GUID from URL-decoded links across the email.
    */
   extractTournamentId(cleanHtml, subjectFallback) {
     const hrefRegex = /href\s*=\s*["']([^"']+)["']/gi;
@@ -224,8 +251,85 @@ const TournamentEntrySync = {
   },
 
   /**
-   * Parses both confirmed and withdrawn ("Inaktivera") entries from a confirmation email,
-   * regardless of whether table headers use <th> or <td> tags.
+   * Parses a "Status update for one of your doubles pairs" email.
+   */
+  parseDoublesStatusEmail(message, tournamentId) {
+    const html = message.getBody();
+    const emailDate = message.getDate();
+    const $ = Cheerio.load(html);
+
+    const clean = (str) => (str || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+
+    const tournamentName = clean($('a.mail-media__link').first().text());
+    const tournamentDate = clean($('span.text-label--sub').first().text());
+
+    // Convert <br> tags to newlines inside the message body paragraph so each line is isolated
+    let bodyLines = [];
+    $('p').each((i, p) => {
+      const pHtml = $(p).html() || '';
+      if (/Tournament:/i.test(pHtml) && /Event:/i.test(pHtml) && /Status:/i.test(pHtml)) {
+        bodyLines = pHtml
+          .split(/<br\s*\/?>/i)
+          .map((frag) => clean(Cheerio.load(frag).text()))
+          .filter(Boolean);
+        return false;
+      }
+    });
+
+    let parsedTournamentName = tournamentName;
+    let klass = '';
+    let status = '';
+    const pairPlayers = [];
+    let inPairSection = false;
+
+    bodyLines.forEach((line) => {
+      if (/^Tournament:\s*/i.test(line)) {
+        const t = line.replace(/^Tournament:\s*/i, '').trim();
+        if (t) parsedTournamentName = t;
+      } else if (/^Event:\s*/i.test(line)) {
+        klass = line.replace(/^Event:\s*/i, '').trim();
+      } else if (/^Status:\s*/i.test(line)) {
+        status = line.replace(/^Status:\s*/i, '').trim();
+      } else if (/^Pair:\s*$/i.test(line)) {
+        inPairSection = true;
+      } else if (inPairSection) {
+        // Format: "IID02053844 Frans Tegenmark"
+        const playerMatch = line.match(/^(IID\d+)\s+(.+)$/i);
+        if (playerMatch) {
+          pairPlayers.push({
+            license: playerMatch[1].toUpperCase(),
+            name: this.toLastFirstName(playerMatch[2]),
+          });
+        }
+      }
+    });
+
+    return {
+      tournamentId,
+      tournamentName: parsedTournamentName,
+      tournamentDate,
+      emailDate,
+      klass,
+      status,
+      player1: pairPlayers[0] || { license: '', name: '' },
+      player2: pairPlayers[1] || { license: '', name: '' },
+    };
+  },
+
+  /**
+   * Normalizes "Frans Tegenmark" to "Tegenmark, Frans" to match full snapshot format.
+   */
+  toLastFirstName(fullName) {
+    const cleanName = String(fullName || '').trim();
+    if (!cleanName || cleanName.includes(',')) return cleanName;
+    const parts = cleanName.split(/\s+/);
+    if (parts.length < 2) return cleanName;
+    const last = parts.pop();
+    return `${last}, ${parts.join(' ')}`;
+  },
+
+  /**
+   * Parses both confirmed and withdrawn ("Inaktivera") entries from a full confirmation email.
    */
   parseConfirmationEmail(message, tournamentId) {
     const html = message.getBody();
@@ -246,7 +350,6 @@ const TournamentEntrySync = {
     const tournamentDate = clean($('span.text-label--sub').first().text());
     const endDate = this.parseEndDate(tournamentDate);
 
-    // Inspect all leaf tables (tables that do not wrap outer layout tables)
     const leafTables = $('table').filter((i, el) => $(el).find('table').length === 0);
 
     const entries = [];
@@ -257,12 +360,10 @@ const TournamentEntrySync = {
       $(tableEl)
         .find('tr')
         .each((rIdx, tr) => {
-          // Skip explicit <th> header rows
           if ($(tr).children('th').length > 0) return;
 
           const tds = $(tr).children('td');
 
-          // Capture total cost footer row
           if (tds.length === 1) {
             const rowText = clean($(tds[0]).text());
             if (rowText.startsWith('Total entry costs:')) {
@@ -276,7 +377,6 @@ const TournamentEntrySync = {
           const klass = clean($(tds[0]).text());
           const klassLower = klass.toLowerCase();
 
-          // Skip <td>-based header rows and email boilerplate
           if (!klass || klassLower === 'klass' || klassLower === 'class' || klass.length > 60) {
             return;
           }
@@ -289,7 +389,6 @@ const TournamentEntrySync = {
 
           if (!players[0]) return;
 
-          // Withdrawn ("Inaktivera") rows have 7+ columns and a YYYY-MM-DD timestamp in column 6 (index 5)
           const isWithdrawnRow = tds.length >= 7 && /\d{4}-\d{2}-\d{2}/.test(col5Text);
 
           const entryObj = isWithdrawnRow
@@ -324,7 +423,6 @@ const TournamentEntrySync = {
                 reason: '',
               };
 
-          // Prevent duplicates if the email HTML includes a hidden mobile version of the same table
           const dedupeKey = [
             entryObj.withdrawn,
             entryObj.klass,
@@ -366,21 +464,83 @@ const TournamentEntrySync = {
   },
 
   /**
-   * Syncs confirmed and withdrawn entries into one sheet, overwriting
-   * existing rows only for tournaments that received a newer email.
+   * Applies a parsed doubles status update onto a tournament's rows in memory.
+   * Updates Request Status (col 13) and Email Timestamp (col 17) on matching active doubles rows,
+   * or appends a new row if no snapshot row exists yet.
    */
-  syncEntriesSheet(sheet, headers, existingData, parsedTournaments) {
-    const tournamentsToOverwrite = new Set();
-    const newRows = [];
+  applyDoublesUpdateToRows(tournamentRows, update) {
+    const targetClass = String(update.klass || '').trim().toLowerCase();
+    const licA = String(update.player1.license || '').trim().toUpperCase();
+    const licB = String(update.player2.license || '').trim().toUpperCase();
 
-    parsedTournaments.forEach((t) => {
-      tournamentsToOverwrite.add(t.tournamentId);
+    let matched = false;
 
-      t.entries.forEach((e) => {
-        newRows.push([
-          t.tournamentId,
-          t.tournamentName,
-          t.tournamentDate,
+    for (let i = 0; i < tournamentRows.length; i++) {
+      const row = tournamentRows[i];
+      const isWithdrawn = String(row[3]).toUpperCase() === 'TRUE';
+      if (isWithdrawn) continue;
+
+      const rowClass = String(row[4] || '').trim().toLowerCase();
+      if (rowClass !== targetClass) continue;
+
+      const rowLic1 = String(row[6] || '').trim().toUpperCase();
+      const rowLic2 = String(row[10] || '').trim().toUpperCase();
+
+      const samePair =
+        (rowLic1 === licA && rowLic2 === licB) ||
+        (rowLic1 === licB && rowLic2 === licA);
+
+      if (samePair) {
+        row[13] = update.status;
+        if (update.emailDate > row[17]) {
+          row[17] = update.emailDate;
+        }
+        matched = true;
+      }
+    }
+
+    // Fallback: if no full snapshot email exists for this tournament yet, create the row
+    if (!matched && update.klass && (licA || licB)) {
+      tournamentRows.push([
+        update.tournamentId,
+        update.tournamentName,
+        update.tournamentDate,
+        false,
+        update.klass,
+        update.player1.name,
+        update.player1.license,
+        '',
+        '',
+        update.player2.name,
+        update.player2.license,
+        '',
+        '',
+        update.status,
+        '',
+        '',
+        '',
+        update.emailDate,
+      ]);
+    }
+  },
+
+  /**
+   * Syncs confirmed, withdrawn, and doubles-status-patched entries into one sheet.
+   */
+  syncEntriesSheet(sheet, headers, existingData, tournamentsToProcess) {
+    const tournamentsBeingUpdated = new Set(tournamentsToProcess.map((t) => t.tournamentId));
+    const rebuiltRows = [];
+
+    tournamentsToProcess.forEach((item) => {
+      let tournamentRows = [];
+
+      if (item.latestSnapshot) {
+        // Start from the latest full confirmation email snapshot
+        const parsed = this.parseConfirmationEmail(item.latestSnapshot.message, item.tournamentId);
+        tournamentRows = parsed.entries.map((e) => [
+          parsed.tournamentId,
+          parsed.tournamentName,
+          parsed.tournamentDate,
           e.withdrawn,
           e.klass,
           e.player1,
@@ -394,19 +554,40 @@ const TournamentEntrySync = {
           e.requestStatus,
           e.removedOn,
           e.reason,
-          t.totalCost,
-          t.emailDate,
+          parsed.totalCost,
+          parsed.emailDate,
         ]);
+
+        Logger.log(
+          `Parsed snapshot "${parsed.tournamentName}" (${parsed.tournamentDate}) -> ${tournamentRows.length} rows`
+        );
+      } else {
+        // No full snapshot in lookback window; preserve existing valid rows for this tournament and patch them
+        tournamentRows = existingData
+          .slice(1)
+          .filter((row) => String(row[0] || '').trim() === item.tournamentId)
+          .map((row) => row.slice());
+      }
+
+      // Apply any newer doubles pair status updates chronologically
+      item.relevantDoublesUpdates.forEach((u) => {
+        const parsedUpdate = this.parseDoublesStatusEmail(u.message, item.tournamentId);
+        this.applyDoublesUpdateToRows(tournamentRows, parsedUpdate);
+        Logger.log(
+          `Applied doubles update "${parsedUpdate.tournamentName}" [${parsedUpdate.klass}] ${parsedUpdate.player1.name} / ${parsedUpdate.player2.name} -> ${parsedUpdate.status}`
+        );
       });
+
+      tournamentRows.forEach((r) => rebuiltRows.push(r));
     });
 
-    // Drop rows being overwritten AND any legacy non-GUID fallback rows
+    // Keep rows for untouched tournaments (dropping any legacy non-GUID fallback rows)
     const retainedRows = existingData.slice(1).filter((row) => {
       const rowId = String(row[0] || '').trim();
-      return rowId && this.isGuid(rowId) && !tournamentsToOverwrite.has(rowId);
+      return rowId && this.isGuid(rowId) && !tournamentsBeingUpdated.has(rowId);
     });
 
-    const finalRows = retainedRows.concat(newRows);
+    const finalRows = retainedRows.concat(rebuiltRows);
 
     // Sort by Tournament Date, Tournament Name, Class, then Player 1
     finalRows.sort((a, b) => {
@@ -421,7 +602,7 @@ const TournamentEntrySync = {
     this.writeBatchToSheet(sheet, headers, finalRows);
     CacheService.getScriptCache().remove(PUBLIC_ENTRIES_CACHE_KEY);
     Logger.log(
-      `Synced ${this.SHEET_NAME}: updated ${tournamentsToOverwrite.size} tournament(s), total ${finalRows.length} rows.`
+      `Synced ${this.SHEET_NAME}: updated ${tournamentsBeingUpdated.size} tournament(s), total ${finalRows.length} rows.`
     );
   },
 
