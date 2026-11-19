@@ -145,10 +145,11 @@
     </div>
   </div>
 
-  <!-- Server-injected initial payload -->
-  <script>
-    const INITIAL_DATA = <?!= initialDataJson ?>;
-  </script>
+    <!-- Server-injected initial payload -->
+    <script id="initial-data" type="application/json"><?!= initialDataJson ?></script>
+    <script>
+        const INITIAL_DATA = JSON.parse(document.getElementById('initial-data').textContent || '{}');
+    </script>
 
   <script>
     let appData = INITIAL_DATA || { sjt: { headers: [], rows: [] }, ranking: { headers: [], rows: [] }, lastUpdated: '' };
